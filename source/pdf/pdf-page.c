@@ -443,92 +443,144 @@ pdf_flatten_inheritable_page_items(fz_context *ctx, pdf_obj *page)
 enum
 {
 	PDF_FLAGS_MEMO_BM = 0,
-	PDF_FLAGS_MEMO_OP = 1
+	PDF_FLAGS_MEMO_OP = 1,
+	/* There is only room left for the 'memo exists' bit of this one, so it
+	 * is a plain flag: it is set, or it is not, and it only means something
+	 * together with PDF_FLAGS_MEMO_BM. */
+	PDF_FLAGS_MEMO_BM_NOT_NORMAL = 2
 };
 
-static int pdf_resources_use_blending(fz_context *ctx, pdf_obj *rdb, pdf_cycle_list *cycle_up);
+/*
+ * What a walk of the resources tells us about transparency.
+ *
+ * BLENDING is the answer to "do we need a page-level transparency group?".
+ * It is set for blend modes, but also for transparency groups and soft
+ * masked images that only use the Normal blend mode.
+ *
+ * BLEND_MODE is set if there is (or, where we gave up looking, might be) a
+ * blend mode other than Normal. Only that makes what is painted depend on
+ * the backdrop it is painted onto.
+ */
+enum
+{
+	BLENDING = 1,
+	BLEND_MODE = 2
+};
+
+/* Resources never legitimately nest anywhere near this deep. */
+#define MAX_RESOURCE_DEPTH 256
+
+static int pdf_resources_blending(fz_context *ctx, pdf_obj *rdb, pdf_cycle_list *cycle_up, int depth);
 
 static int
-pdf_extgstate_uses_blending(fz_context *ctx, pdf_obj *dict)
+pdf_extgstate_blending(fz_context *ctx, pdf_obj *dict)
 {
 	pdf_obj *obj = pdf_dict_get(ctx, dict, PDF_NAME(BM));
 	if (obj && !pdf_name_eq(ctx, obj, PDF_NAME(Normal)))
-		return 1;
+		return BLENDING | BLEND_MODE;
 	return 0;
 }
 
-int
-pdf_pattern_uses_blending(fz_context *ctx, pdf_obj *dict, pdf_cycle_list *cycle_up)
+/* We stop at cycles; if that is because the cycle list got too long, then
+ * there may be a blend mode further down that we will not see. */
+static int
+pdf_blending_at_cycle(int cycle)
 {
-	pdf_obj *obj;
-	pdf_cycle_list cycle;
-	if (pdf_cycle(ctx, &cycle, cycle_up, dict))
-		return 0;
-	obj = pdf_dict_get(ctx, dict, PDF_NAME(Resources));
-	if (pdf_resources_use_blending(ctx, obj, &cycle))
-		return 1;
-	obj = pdf_dict_get(ctx, dict, PDF_NAME(ExtGState));
-	return pdf_extgstate_uses_blending(ctx, obj);
+	return cycle < 0 ? BLEND_MODE : 0;
 }
 
 static int
-pdf_xobject_uses_blending(fz_context *ctx, pdf_obj *dict, pdf_cycle_list *cycle_up)
+pdf_pattern_blending(fz_context *ctx, pdf_obj *dict, pdf_cycle_list *cycle_up, int depth)
+{
+	pdf_obj *obj;
+	pdf_cycle_list cycle;
+	int found;
+	int cyclic = pdf_cycle(ctx, &cycle, cycle_up, dict);
+	if (cyclic)
+		return pdf_blending_at_cycle(cyclic);
+	obj = pdf_dict_get(ctx, dict, PDF_NAME(Resources));
+	found = pdf_resources_blending(ctx, obj, &cycle, depth);
+	obj = pdf_dict_get(ctx, dict, PDF_NAME(ExtGState));
+	return found | pdf_extgstate_blending(ctx, obj);
+}
+
+static int
+pdf_xobject_blending(fz_context *ctx, pdf_obj *dict, pdf_cycle_list *cycle_up, int depth)
 {
 	pdf_obj *obj = pdf_dict_get(ctx, dict, PDF_NAME(Resources));
 	pdf_cycle_list cycle;
-	if (pdf_cycle(ctx, &cycle, cycle_up, dict))
-		return 0;
+	int found = 0;
+	int cyclic = pdf_cycle(ctx, &cycle, cycle_up, dict);
+	if (cyclic)
+		return pdf_blending_at_cycle(cyclic);
 	if (pdf_name_eq(ctx, pdf_dict_getp(ctx, dict, "Group/S"), PDF_NAME(Transparency)))
-		return 1;
+		found = BLENDING;
 	if (pdf_name_eq(ctx, pdf_dict_get(ctx, dict, PDF_NAME(Subtype)), PDF_NAME(Image)) &&
 		pdf_dict_get(ctx, dict, PDF_NAME(SMask)) != NULL)
-		return 1;
-	return pdf_resources_use_blending(ctx, obj, &cycle);
+		found = BLENDING;
+	return found | pdf_resources_blending(ctx, obj, &cycle, depth);
 }
 
 static int
-pdf_resources_use_blending(fz_context *ctx, pdf_obj *rdb, pdf_cycle_list *cycle_up)
+pdf_resources_blending(fz_context *ctx, pdf_obj *rdb, pdf_cycle_list *cycle_up, int depth)
 {
 	pdf_cycle_list cycle;
 	pdf_obj *obj;
-	int i, n, useBM = 0;
+	int i, n, cyclic, memo;
+	int found = 0;
 
 	if (!rdb)
 		return 0;
 
 	/* Have we been here before and remembered an answer? */
-	if (pdf_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_BM, &useBM))
-		return useBM;
+	if (pdf_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_BM, &memo))
+	{
+		found = memo ? BLENDING : 0;
+		if (pdf_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_BM_NOT_NORMAL, &memo))
+			found |= BLEND_MODE;
+		return found;
+	}
 
 	/* stop on cyclic resource dependencies */
-	if (pdf_cycle(ctx, &cycle, cycle_up, rdb))
-		return 0;
+	cyclic = pdf_cycle(ctx, &cycle, cycle_up, rdb);
+	if (cyclic)
+		return pdf_blending_at_cycle(cyclic);
+	if (depth > MAX_RESOURCE_DEPTH)
+		return BLEND_MODE;
 
+	/* Finding that we need a transparency group is not enough to stop
+	 * looking: there may still be a blend mode to be found. */
 	obj = pdf_dict_get(ctx, rdb, PDF_NAME(ExtGState));
 	n = pdf_dict_len(ctx, obj);
-	for (i = 0; i < n; i++)
-		if (pdf_extgstate_uses_blending(ctx, pdf_dict_get_val(ctx, obj, i)))
-			goto found;
+	for (i = 0; i < n && found != (BLENDING | BLEND_MODE); i++)
+		found |= pdf_extgstate_blending(ctx, pdf_dict_get_val(ctx, obj, i));
 
 	obj = pdf_dict_get(ctx, rdb, PDF_NAME(Pattern));
 	n = pdf_dict_len(ctx, obj);
-	for (i = 0; i < n; i++)
-		if (pdf_pattern_uses_blending(ctx, pdf_dict_get_val(ctx, obj, i), &cycle))
-			goto found;
+	for (i = 0; i < n && found != (BLENDING | BLEND_MODE); i++)
+		found |= pdf_pattern_blending(ctx, pdf_dict_get_val(ctx, obj, i), &cycle, depth + 1);
 
 	obj = pdf_dict_get(ctx, rdb, PDF_NAME(XObject));
 	n = pdf_dict_len(ctx, obj);
-	for (i = 0; i < n; i++)
-		if (pdf_xobject_uses_blending(ctx, pdf_dict_get_val(ctx, obj, i), &cycle))
-			goto found;
-	if (0)
-	{
-found:
-		useBM = 1;
-	}
+	for (i = 0; i < n && found != (BLENDING | BLEND_MODE); i++)
+		found |= pdf_xobject_blending(ctx, pdf_dict_get_val(ctx, obj, i), &cycle, depth + 1);
 
-	pdf_set_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_BM, useBM);
-	return useBM;
+	pdf_set_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_BM, found & BLENDING);
+	if (found & BLEND_MODE)
+		pdf_set_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_BM_NOT_NORMAL, 0);
+	return found;
+}
+
+static int
+pdf_resources_use_blending(fz_context *ctx, pdf_obj *rdb, pdf_cycle_list *cycle_up)
+{
+	return (pdf_resources_blending(ctx, rdb, cycle_up, 0) & BLENDING) != 0;
+}
+
+int
+pdf_pattern_uses_blending(fz_context *ctx, pdf_obj *dict, pdf_cycle_list *cycle_up)
+{
+	return (pdf_pattern_blending(ctx, dict, cycle_up, 0) & BLENDING) != 0;
 }
 
 static int pdf_resources_use_overprint(fz_context *ctx, pdf_obj *rdb, pdf_cycle_list *cycle_up);
@@ -609,6 +661,29 @@ found:
 
 	pdf_set_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_OP, useOP);
 	return useOP;
+}
+
+/*
+ * Can what is painted using these resources depend on the backdrop it is
+ * painted onto? That takes a blend mode other than Normal, or overprint.
+ * Transparency groups and soft masks composited with the Normal blend mode
+ * give the same result whether they are rendered directly onto the page,
+ * or rendered once in isolation and then composited.
+ */
+int
+pdf_resources_need_backdrop(fz_context *ctx, pdf_obj *rdb)
+{
+	if (pdf_resources_blending(ctx, rdb, NULL, 0) & BLEND_MODE)
+		return 1;
+	return pdf_resources_use_overprint(ctx, rdb, NULL);
+}
+
+int
+pdf_pattern_needs_backdrop(fz_context *ctx, pdf_obj *dict)
+{
+	if (pdf_pattern_blending(ctx, dict, NULL, 0) & BLEND_MODE)
+		return 1;
+	return pdf_pattern_uses_overprint(ctx, dict, NULL);
 }
 
 fz_transition *

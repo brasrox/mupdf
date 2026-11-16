@@ -697,6 +697,30 @@ pdf_grestore(fz_context *ctx, pdf_run_processor *pr)
 	}
 }
 
+/*
+ * A tile can be rendered once and then reused unless what the pattern cell
+ * paints depends on the backdrop. Transparency alone does not make it so;
+ * a blend mode other than Normal (or overprint) does.
+ */
+static int
+pdf_pattern_needs_backdrop_here(fz_context *ctx, pdf_run_processor *pr, pdf_pattern *pat)
+{
+	pdf_resource_stack *stack;
+
+	if (!pat->uses_blending)
+		return 0;
+	if (pat->needs_backdrop)
+		return 1;
+
+	/* The cell can also use the resources of the content streams that
+	 * the pattern is being painted from. */
+	for (stack = pr->super.rstack; stack; stack = stack->next)
+		if (pdf_resources_need_backdrop(ctx, stack->resources))
+			return 1;
+
+	return 0;
+}
+
 static pdf_gstate *
 pdf_show_pattern(fz_context *ctx, pdf_run_processor *pr, pdf_pattern *pat, int pat_gstate_num, fz_rect area, int what)
 {
@@ -787,8 +811,8 @@ pdf_show_pattern(fz_context *ctx, pdf_run_processor *pr, pdf_pattern *pat, int p
 	 * best we've found; only use it as a tile if a whole repeat is
 	 * required in at least one direction. Note, that this allows for
 	 * 'sections' of 4 tiles to be show, but all non-overlapping. */
-	/* If the pattern uses blending, we never use the tile cache. */
-	if ((fx1-fx0 > 1 || fy1-fy0 > 1) && !pat->uses_blending && !(pr->dev->hints & FZ_NO_TILING))
+	/* If the pattern blends with the backdrop, we never use the tile cache. */
+	if ((fx1-fx0 > 1 || fy1-fy0 > 1) && !(pr->dev->hints & FZ_NO_TILING) && !pdf_pattern_needs_backdrop_here(ctx, pr, pat))
 #else
 	if (0)
 #endif

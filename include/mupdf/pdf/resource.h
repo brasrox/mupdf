@@ -37,6 +37,8 @@ void pdf_purge_locals_from_store(fz_context *ctx, pdf_document *doc);
 void pdf_purge_object_from_store(fz_context *ctx, pdf_document *doc, int num);
 
 int pdf_pattern_uses_blending(fz_context *ctx, pdf_obj *dict, pdf_cycle_list *cycle_up);
+int pdf_pattern_needs_backdrop(fz_context *ctx, pdf_obj *dict);
+int pdf_resources_need_backdrop(fz_context *ctx, pdf_obj *rdb);
 
 /*
  * Structures used for managing resource locations and avoiding multiple
@@ -156,6 +158,7 @@ typedef struct pdf_pattern
 	pdf_obj *contents;
 	int id; /* unique ID for caching rendered tiles */
 	int uses_blending;
+	int needs_backdrop; /* only looked at if uses_blending */
 } pdf_pattern;
 
 pdf_pattern *pdf_load_pattern(fz_context *ctx, pdf_document *doc, pdf_obj *obj);
