@@ -787,8 +787,14 @@ pdf_show_pattern(fz_context *ctx, pdf_run_processor *pr, pdf_pattern *pat, int p
 	 * best we've found; only use it as a tile if a whole repeat is
 	 * required in at least one direction. Note, that this allows for
 	 * 'sections' of 4 tiles to be show, but all non-overlapping. */
-	/* If the pattern uses blending, we never use the tile cache. */
-	if ((fx1-fx0 > 1 || fy1-fy0 > 1) && !pat->uses_blending && !(pr->dev->hints & FZ_NO_TILING))
+	/* Unlike upstream since d63e53e80 (Bug 701933), we use the tile cache
+	 * for patterns that use blending as well, as 1.27 did. Upstream paints
+	 * those one tile at a time, which is right for blend modes other than
+	 * Normal, but it does so for any transparency in the cell, and for
+	 * every tile in the bbox of the filled shape: a rectangle with 119,000
+	 * tiles under a small clip takes a second per fill and a display list
+	 * that does not fit in memory. */
+	if ((fx1-fx0 > 1 || fy1-fy0 > 1) && !(pr->dev->hints & FZ_NO_TILING))
 #else
 	if (0)
 #endif
