@@ -721,6 +721,74 @@ pdf_pattern_needs_backdrop_here(fz_context *ctx, pdf_run_processor *pr, pdf_patt
 	return 0;
 }
 
+/*
+ * Restrict the range of tiles [x0,x1) x [y0,y1) that we are about to paint
+ * one by one to the tiles that can touch the current clip.
+ *
+ * The area we are asked to fill is the bbox of the shape, which can be
+ * vastly larger than what the enclosing clips allow to be seen. Tile (x,y)
+ * covers the pattern bbox translated by (x * xstep, y * ystep).
+ */
+static void
+pdf_cull_pattern_tiles(fz_context *ctx, fz_device *dev, pdf_pattern *pat, fz_matrix invptm, int *x0, int *y0, int *x1, int *y1)
+{
+	fz_rect clip;
+	float lo, hi, t;
+	int i;
+
+	/* Within a tile the device tracks the scissor in pattern space
+	 * rather than in device space, so we cannot rely on it. */
+	for (i = 0; i < dev->container_len; i++)
+		if (dev->container[i].type == fz_device_container_stack_is_tile)
+			return;
+
+	clip = fz_device_current_scissor(ctx, dev);
+	if (fz_is_infinite_rect(clip))
+		return;
+
+	/* A tile just outside the clip can still contribute to the pixels
+	 * on its edge, so keep a margin. The scissor is an intersection
+	 * of bboxes, so it may be inside out; we must grow it before
+	 * testing whether anything is left. */
+	clip.x0 -= 1;
+	clip.y0 -= 1;
+	clip.x1 += 1;
+	clip.y1 += 1;
+	if (fz_is_empty_rect(clip))
+	{
+		*x1 = *x0;
+		*y1 = *y0;
+		return;
+	}
+	clip = fz_transform_rect(clip, invptm);
+
+	lo = (clip.x0 - pat->bbox.x1) / pat->xstep;
+	hi = (clip.x1 - pat->bbox.x0) / pat->xstep;
+	if (lo > hi)
+	{
+		t = lo; lo = hi; hi = t;
+	}
+	lo = floorf(lo);
+	hi = ceilf(hi);
+	if (lo > *x0)
+		*x0 = lo < *x1 ? (int)lo : *x1;
+	if (hi < *x1)
+		*x1 = hi > *x0 ? (int)hi : *x0;
+
+	lo = (clip.y0 - pat->bbox.y1) / pat->ystep;
+	hi = (clip.y1 - pat->bbox.y0) / pat->ystep;
+	if (lo > hi)
+	{
+		t = lo; lo = hi; hi = t;
+	}
+	lo = floorf(lo);
+	hi = ceilf(hi);
+	if (lo > *y0)
+		*y0 = lo < *y1 ? (int)lo : *y1;
+	if (hi < *y1)
+		*y1 = hi > *y0 ? (int)hi : *y0;
+}
+
 static pdf_gstate *
 pdf_show_pattern(fz_context *ctx, pdf_run_processor *pr, pdf_pattern *pat, int pat_gstate_num, fz_rect area, int what)
 {
@@ -855,6 +923,9 @@ pdf_show_pattern(fz_context *ctx, pdf_run_processor *pr, pdf_pattern *pat, int p
 			x1 = x0 + 1;
 		if (fy1 > fy0 && y1 == y0)
 			y1 = y0 + 1;
+
+		/* Tiles that the current clip hides do not need to be painted. */
+		pdf_cull_pattern_tiles(ctx, pr->dev, pat, invptm, &x0, &y0, &x1, &y1);
 
 		for (y = y0; y < y1; y++)
 		{
