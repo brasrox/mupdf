@@ -611,6 +611,125 @@ found:
 	return useOP;
 }
 
+/*
+ * Does the result of painting this pattern cell depend on the backdrop it
+ * is painted onto? If it does, a rendered tile cannot be reused.
+ *
+ * pdf_pattern_uses_blending answers a different question: "does this need
+ * a page level transparency group?". That is also true for cells that draw
+ * transparency groups or soft masked images with the Normal blend mode,
+ * and those give the same result whether the cell is rendered directly onto
+ * the page or rendered once in isolation and then composited. So of the
+ * patterns that use transparency, we pick the ones that have a blend mode
+ * other than Normal, or that overprint.
+ *
+ * Every indirect object we pass through is marked, so each is looked at
+ * only once, and cyclic resources terminate. The marks are kept per role,
+ * as the same object could be reached both as a resource dictionary and as
+ * an XObject. If the resources nest too deeply we give up, and assume that
+ * the cell does depend on the backdrop.
+ */
+#define MAX_BLEND_MODE_DEPTH 256
+
+typedef struct
+{
+	pdf_mark_bits *resources; /* resource dictionaries */
+	pdf_mark_bits *subdicts; /* their Pattern and XObject dictionaries */
+	pdf_mark_bits *objects; /* patterns and XObjects */
+} blend_mode_marks;
+
+static int pdf_resources_use_blend_mode(fz_context *ctx, pdf_obj *rdb, blend_mode_marks *marks, int depth);
+
+/* For both patterns and XObjects. */
+static int
+pdf_object_uses_blend_mode(fz_context *ctx, pdf_obj *dict, blend_mode_marks *marks, int depth)
+{
+	if (pdf_mark_bits_set(ctx, marks->objects, dict))
+		return 0;
+	/* A shading pattern has its ExtGState in the pattern dictionary. */
+	if (pdf_extgstate_uses_blending(ctx, pdf_dict_get(ctx, dict, PDF_NAME(ExtGState))))
+		return 1;
+	return pdf_resources_use_blend_mode(ctx, pdf_dict_get(ctx, dict, PDF_NAME(Resources)), marks, depth + 1);
+}
+
+static int
+pdf_resources_use_blend_mode(fz_context *ctx, pdf_obj *rdb, blend_mode_marks *marks, int depth)
+{
+	static pdf_obj *const subdicts[] = { PDF_NAME(Pattern), PDF_NAME(XObject) };
+	pdf_obj *obj;
+	int i, k, n, useBM;
+
+	if (!rdb)
+		return 0;
+
+	if (depth > MAX_BLEND_MODE_DEPTH)
+		return 1;
+
+	if (pdf_mark_bits_set(ctx, marks->resources, rdb))
+		return 0;
+
+	/* If we already know that nothing in here uses transparency at all,
+	 * then nothing in here can use a blend mode either. */
+	if (pdf_obj_memo(ctx, rdb, PDF_FLAGS_MEMO_BM, &useBM) && !useBM)
+		return 0;
+
+	obj = pdf_dict_get(ctx, rdb, PDF_NAME(ExtGState));
+	n = pdf_dict_len(ctx, obj);
+	for (i = 0; i < n; i++)
+		if (pdf_extgstate_uses_blending(ctx, pdf_dict_get_val(ctx, obj, i)))
+			return 1;
+
+	for (k = 0; k < (int)nelem(subdicts); k++)
+	{
+		obj = pdf_dict_get(ctx, rdb, subdicts[k]);
+		if (pdf_mark_bits_set(ctx, marks->subdicts, obj))
+			continue;
+		n = pdf_dict_len(ctx, obj);
+		for (i = 0; i < n; i++)
+			if (pdf_object_uses_blend_mode(ctx, pdf_dict_get_val(ctx, obj, i), marks, depth))
+				return 1;
+	}
+
+	return 0;
+}
+
+int
+pdf_pattern_needs_backdrop(fz_context *ctx, pdf_document *doc, pdf_obj *dict)
+{
+	blend_mode_marks marks = { NULL, NULL, NULL };
+	int needs = 0;
+
+	/* The common case: no transparency of any kind. */
+	if (!pdf_pattern_uses_blending(ctx, dict, NULL))
+		return 0;
+
+	if (pdf_pattern_uses_overprint(ctx, dict, NULL))
+		return 1;
+
+	fz_var(needs);
+	fz_var(marks.resources);
+	fz_var(marks.subdicts);
+	fz_var(marks.objects);
+
+	fz_try(ctx)
+	{
+		marks.resources = pdf_new_mark_bits(ctx, doc);
+		marks.subdicts = pdf_new_mark_bits(ctx, doc);
+		marks.objects = pdf_new_mark_bits(ctx, doc);
+		needs = pdf_object_uses_blend_mode(ctx, dict, &marks, 0);
+	}
+	fz_always(ctx)
+	{
+		pdf_drop_mark_bits(ctx, marks.resources);
+		pdf_drop_mark_bits(ctx, marks.subdicts);
+		pdf_drop_mark_bits(ctx, marks.objects);
+	}
+	fz_catch(ctx)
+		fz_rethrow(ctx);
+
+	return needs;
+}
+
 fz_transition *
 pdf_page_presentation(fz_context *ctx, pdf_page *page, fz_transition *transition, float *duration)
 {

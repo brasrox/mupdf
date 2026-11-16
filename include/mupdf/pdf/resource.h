@@ -37,6 +37,7 @@ void pdf_purge_locals_from_store(fz_context *ctx, pdf_document *doc);
 void pdf_purge_object_from_store(fz_context *ctx, pdf_document *doc, int num);
 
 int pdf_pattern_uses_blending(fz_context *ctx, pdf_obj *dict, pdf_cycle_list *cycle_up);
+int pdf_pattern_needs_backdrop(fz_context *ctx, pdf_document *doc, pdf_obj *dict);
 
 /*
  * Structures used for managing resource locations and avoiding multiple
